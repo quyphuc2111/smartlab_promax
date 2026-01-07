@@ -1,0 +1,112 @@
+name: Build Windows App
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+            backend -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build backend API server
+        run: |
+          cd backend
+          cargo build --release
+        shell: bash
+
+      - name: Copy backend to resources
+        run: |
+          mkdir -p src-tauri/resources
+          cp backend/target/release/ip_scanner_api.exe src-tauri/resources/
+        shell: bash
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'SmartLab v__VERSION__'
+          releaseBody: |
+            ## SmartLab - Hệ thống quản lý phòng máy thông minh
+            
+            ### Tính năng:
+            - Quản lý phòng máy và thiết bị
+            - Điều khiển máy tính từ xa
+            - Quản lý ca thực hành
+            - Hỗ trợ giảng dạy trực tuyến
+            
+            ### Cài đặt:
+            - Tải file `.msi` hoặc `.exe` bên dưới
+            - Chạy installer và làm theo hướng dẫn
+          releaseDraft: true
+          prerelease: false
+
+      - name: Create release package
+        run: |
+          mkdir -p release-package
+          cp backend/target/release/ip_scanner_api.exe release-package/
+          cp -r src-tauri/target/release/bundle/msi/*.msi release-package/ 2>/dev/null || true
+          cp -r src-tauri/target/release/bundle/nsis/*.exe release-package/ 2>/dev/null || true
+        shell: bash
+
+      - name: Upload Windows Installer (MSI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartlab-windows-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload Windows Installer (EXE)
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartlab-windows-exe
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload Backend Server
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartlab-backend-server
+          path: backend/target/release/ip_scanner_api.exe
+          retention-days: 30
+
+      - name: Upload Complete Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartlab-complete-package
+          path: release-package/
+          retention-days: 30
