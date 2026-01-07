@@ -38,8 +38,9 @@ async fn main() {
         .route("/api/room-computers/:id", delete(handlers::delete_room_computer))
         .layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("🚀 Server running at http://{}", addr);
+    println!("📡 Accessible from LAN at port 3000");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
