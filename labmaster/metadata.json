@@ -1,0 +1,8 @@
+{
+  "name": "LabMaster Pro - Hệ thống Quản lý Phòng máy Thông minh",
+  "description": "Một giải pháp toàn diện để quản lý phòng máy tính, giáo viên, học sinh, và các ca thực hành trực tuyến với tích hợp AI hỗ trợ giảng dạy.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
