@@ -627,16 +627,21 @@ fn get_app_mode() -> AppMode {
 
 /// Set app mode (Teacher/Client)
 #[tauri::command]
-fn set_app_mode(mode: AppMode) -> Result<String, String> {
+fn set_app_mode(mode: String) -> Result<String, String> {
+    let app_mode = match mode.as_str() {
+        "Teacher" => AppMode::Teacher,
+        _ => AppMode::Client,
+    };
+    
     let mut current_mode = APP_MODE.lock().map_err(|e| e.to_string())?;
-    *current_mode = mode;
+    *current_mode = app_mode;
     
     // Save to config file
     let config_path = get_config_path();
     let config = serde_json::json!({ "mode": mode });
     std::fs::write(&config_path, config.to_string()).ok();
     
-    Ok(format!("Mode set to {:?}", mode))
+    Ok(format!("Mode set to {}", mode))
 }
 
 /// Load saved app mode from config

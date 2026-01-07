@@ -1,23 +1,11 @@
 import React, { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { 
   Monitor, Grid, List, Wrench, AlertTriangle, CheckCircle2, RefreshCw,
   PowerOff, Eye, RotateCcw, Wifi, WifiOff
 } from 'lucide-react';
 import { RoomComputer, ComputerStatus } from '../types';
 import { getRoomComputers, checkComputerStatus } from '../api';
-
-// Tauri invoke
-declare global {
-  interface Window {
-    __TAURI__?: {
-      core: {
-        invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
-      };
-    };
-  }
-}
-
-const invoke = window.__TAURI__?.core?.invoke;
 
 interface RemoteCommandResult {
   success: boolean;
@@ -86,7 +74,7 @@ const LabControl: React.FC = () => {
   };
 
   const handleViewScreen = async (pc: RoomComputer) => {
-    if (!invoke || !pc.ip_address) return;
+    if (!pc.ip_address) return;
     
     setActionLoading(`view-${pc.room_computer_id}`);
     try {
@@ -104,6 +92,7 @@ const LabControl: React.FC = () => {
         showNotification('error', result.message);
       }
     } catch (error) {
+      console.error('View screen error:', error);
       showNotification('error', 'Không thể kết nối đến máy');
     } finally {
       setActionLoading(null);
@@ -111,17 +100,20 @@ const LabControl: React.FC = () => {
   };
 
   const handleRemoteDesktop = async (pc: RoomComputer) => {
-    if (!invoke || !pc.ip_address) return;
+    if (!pc.ip_address) return;
     
     setActionLoading(`rdp-${pc.room_computer_id}`);
     try {
+      console.log('Opening remote desktop to:', pc.ip_address);
       const result = await invoke<RemoteCommandResult>('open_remote_desktop', { ip: pc.ip_address });
+      console.log('Remote desktop result:', result);
       if (result.success) {
         showNotification('success', result.message);
       } else {
         showNotification('error', result.message);
       }
     } catch (error) {
+      console.error('Remote desktop error:', error);
       showNotification('error', 'Không thể mở Remote Desktop');
     } finally {
       setActionLoading(null);
@@ -129,7 +121,7 @@ const LabControl: React.FC = () => {
   };
 
   const handleShutdown = async (pc: RoomComputer) => {
-    if (!invoke || !pc.ip_address) return;
+    if (!pc.ip_address) return;
     if (!confirm(`Bạn có chắc muốn tắt máy ${pc.computer_name}?`)) return;
     
     setActionLoading(`shutdown-${pc.room_computer_id}`);
@@ -137,12 +129,12 @@ const LabControl: React.FC = () => {
       const result = await invoke<RemoteCommandResult>('remote_shutdown', { ip: pc.ip_address });
       if (result.success) {
         showNotification('success', `Đã gửi lệnh tắt máy đến ${pc.computer_name}`);
-        // Cập nhật trạng thái sau vài giây
         setTimeout(() => checkAllStatuses(), 5000);
       } else {
         showNotification('error', result.message);
       }
     } catch (error) {
+      console.error('Shutdown error:', error);
       showNotification('error', 'Không thể tắt máy');
     } finally {
       setActionLoading(null);
@@ -150,7 +142,7 @@ const LabControl: React.FC = () => {
   };
 
   const handleRestart = async (pc: RoomComputer) => {
-    if (!invoke || !pc.ip_address) return;
+    if (!pc.ip_address) return;
     if (!confirm(`Bạn có chắc muốn khởi động lại máy ${pc.computer_name}?`)) return;
     
     setActionLoading(`restart-${pc.room_computer_id}`);
@@ -162,6 +154,7 @@ const LabControl: React.FC = () => {
         showNotification('error', result.message);
       }
     } catch (error) {
+      console.error('Restart error:', error);
       showNotification('error', 'Không thể khởi động lại máy');
     } finally {
       setActionLoading(null);

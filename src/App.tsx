@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   LayoutDashboard,
   Users,
@@ -25,19 +26,6 @@ import DocumentManager from "./views/DocumentManager";
 import Messaging from "./views/Messaging";
 import { User, UserRole } from "./types";
 import { getCurrentUser, setToken, getToken } from "./api";
-
-// Tauri invoke
-declare global {
-  interface Window {
-    __TAURI__?: {
-      core: {
-        invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
-      };
-    };
-  }
-}
-
-const invoke = window.__TAURI__?.core?.invoke;
 
 type AppMode = "Teacher" | "Client";
 
@@ -80,8 +68,6 @@ export default function App() {
   // Load app mode and auto-start services for Teacher mode
   useEffect(() => {
     async function initApp() {
-      if (!invoke) return;
-      
       try {
         // Load saved mode from config.json
         const mode = await invoke<AppMode>('load_app_mode');
@@ -109,17 +95,33 @@ export default function App() {
 
   // Start backend when Teacher/Admin logs in (fallback)
   useEffect(() => {
-    if (user && invoke) {
-      const needsBackend = user.role === UserRole.TEACHER || user.role === UserRole.ADMINISTRATOR;
+    console.log("User changed:", user?.user_name, user?.role);
+    if (user) {
+      const needsBackend = user.role === 'Teacher' || user.role === 'Administrator';
+      console.log("Needs backend:", needsBackend, "role:", user.role);
       if (needsBackend) {
-        startBackendServer();
+        setAppModeAndStartServices();
       }
     }
   }, [user]);
 
+  const setAppModeAndStartServices = async () => {
+    try {
+      console.log("Setting app mode to Teacher...");
+      const result = await invoke<string>('set_app_mode', { mode: 'Teacher' });
+      console.log("set_app_mode result:", result);
+      setAppMode('Teacher');
+      
+      await startBackendServer();
+      
+      await invoke('start_server_broadcast');
+      console.log('Server broadcast started');
+    } catch (error) {
+      console.error('Failed to set app mode:', error);
+    }
+  };
+
   const startBackendServer = async () => {
-    if (!invoke) return;
-    
     try {
       // Check if already running
       const status = await invoke<BackendStatus>('check_backend_status');
