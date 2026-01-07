@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use surge_ping::{Client, Config, PingIdentifier, PingSequence};
@@ -12,6 +12,21 @@ use serde::Deserialize;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
+
+// Constants for UDP Discovery
+const DISCOVERY_PORT: u16 = 5959;
+const DISCOVERY_MAGIC: &[u8] = b"SMARTLAB_SERVER";
+const BROADCAST_INTERVAL_MS: u64 = 2000;
+
+// App mode
+static APP_MODE: Lazy<StdMutex<AppMode>> = Lazy::new(|| StdMutex::new(AppMode::Client));
+static UDP_BROADCASTER: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum AppMode {
+    Teacher,  // Server mode - runs backend, broadcasts presence
+    Client,   // Student mode - discovers server
+}
 
 // Backend process management
 static BACKEND_PROCESS: Lazy<StdMutex<Option<Child>>> = Lazy::new(|| StdMutex::new(None));
@@ -595,6 +610,173 @@ pub struct BackendStatus {
     pub message: String,
 }
 
+// ==================== UDP DISCOVERY ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryResult {
+    pub found: bool,
+    pub server_ip: Option<String>,
+    pub message: String,
+}
+
+/// Get current app mode
+#[tauri::command]
+fn get_app_mode() -> AppMode {
+    *APP_MODE.lock().unwrap()
+}
+
+/// Set app mode (Teacher/Client)
+#[tauri::command]
+fn set_app_mode(mode: AppMode) -> Result<String, String> {
+    let mut current_mode = APP_MODE.lock().map_err(|e| e.to_string())?;
+    *current_mode = mode;
+    
+    // Save to config file
+    let config_path = get_config_path();
+    let config = serde_json::json!({ "mode": mode });
+    std::fs::write(&config_path, config.to_string()).ok();
+    
+    Ok(format!("Mode set to {:?}", mode))
+}
+
+/// Load saved app mode from config
+#[tauri::command]
+fn load_app_mode() -> AppMode {
+    let config_path = get_config_path();
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(mode_str) = config.get("mode").and_then(|v| v.as_str()) {
+                return match mode_str {
+                    "Teacher" => AppMode::Teacher,
+                    _ => AppMode::Client,
+                };
+            }
+        }
+    }
+    AppMode::Client
+}
+
+fn get_config_path() -> std::path::PathBuf {
+    // First check if config exists next to exe (for portable install)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let portable_config = exe_dir.join("config.json");
+            if portable_config.exists() {
+                return portable_config;
+            }
+        }
+    }
+    
+    // Otherwise use user config dir
+    let mut path = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push("smartlab");
+    std::fs::create_dir_all(&path).ok();
+    path.push("config.json");
+    path
+}
+
+/// Start UDP broadcast (Teacher mode) - broadcasts server presence
+#[tauri::command]
+async fn start_server_broadcast() -> Result<String, String> {
+    if UDP_BROADCASTER.load(Ordering::SeqCst) {
+        return Ok("Broadcast already running".to_string());
+    }
+    
+    UDP_BROADCASTER.store(true, Ordering::SeqCst);
+    
+    tokio::spawn(async {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to bind UDP socket: {}", e);
+                UDP_BROADCASTER.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        
+        socket.set_broadcast(true).ok();
+        
+        let local_ip = get_local_ip().map(|ip| ip.to_string()).unwrap_or_default();
+        let message = format!("{}|{}", String::from_utf8_lossy(DISCOVERY_MAGIC), local_ip);
+        
+        while UDP_BROADCASTER.load(Ordering::SeqCst) {
+            // Broadcast to 255.255.255.255
+            let _ = socket.send_to(message.as_bytes(), format!("255.255.255.255:{}", DISCOVERY_PORT));
+            
+            // Also broadcast to subnet broadcast
+            if let Some(ip) = get_local_ip() {
+                let octets = ip.octets();
+                let subnet_broadcast = format!("{}.{}.{}.255:{}", octets[0], octets[1], octets[2], DISCOVERY_PORT);
+                let _ = socket.send_to(message.as_bytes(), subnet_broadcast);
+            }
+            
+            std::thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
+        }
+    });
+    
+    Ok("Server broadcast started".to_string())
+}
+
+/// Stop UDP broadcast
+#[tauri::command]
+fn stop_server_broadcast() -> String {
+    UDP_BROADCASTER.store(false, Ordering::SeqCst);
+    "Broadcast stopped".to_string()
+}
+
+/// Discover server via UDP (Client mode)
+#[tauri::command]
+async fn discover_server_udp() -> Result<DiscoveryResult, String> {
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT))
+        .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
+        .map_err(|e| e.to_string())?;
+    
+    socket.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    socket.set_broadcast(true).ok();
+    
+    // Send discovery request
+    let request = b"SMARTLAB_DISCOVER";
+    let _ = socket.send_to(request, format!("255.255.255.255:{}", DISCOVERY_PORT));
+    
+    // Also send to subnet
+    if let Some(ip) = get_local_ip() {
+        let octets = ip.octets();
+        let subnet_broadcast = format!("{}.{}.{}.255:{}", octets[0], octets[1], octets[2], DISCOVERY_PORT);
+        let _ = socket.send_to(request, subnet_broadcast);
+    }
+    
+    // Listen for response
+    let mut buf = [0u8; 256];
+    let start = std::time::Instant::now();
+    
+    while start.elapsed() < Duration::from_secs(5) {
+        match socket.recv_from(&mut buf) {
+            Ok((len, addr)) => {
+                let message = String::from_utf8_lossy(&buf[..len]);
+                let magic = String::from_utf8_lossy(DISCOVERY_MAGIC);
+                if message.starts_with(magic.as_ref()) {
+                    let parts: Vec<&str> = message.split('|').collect();
+                    if parts.len() >= 2 {
+                        let server_ip = parts[1].to_string();
+                        return Ok(DiscoveryResult {
+                            found: true,
+                            server_ip: Some(server_ip),
+                            message: format!("Found server at {}", addr.ip()),
+                        });
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    Ok(DiscoveryResult {
+        found: false,
+        server_ip: None,
+        message: "No server found".to_string(),
+    })
+}
+
 /// Start backend server
 #[tauri::command]
 fn start_backend(app_handle: tauri::AppHandle) -> Result<BackendStatus, String> {
@@ -747,7 +929,14 @@ pub fn run() {
             open_remote_desktop,
             start_backend,
             stop_backend,
-            check_backend_status
+            check_backend_status,
+            // UDP Discovery
+            get_app_mode,
+            set_app_mode,
+            load_app_mode,
+            start_server_broadcast,
+            stop_server_broadcast,
+            discover_server_udp
         ])
         .on_window_event(|_window, event| {
             // Stop backend when app closes

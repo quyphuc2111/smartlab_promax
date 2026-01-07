@@ -31,4 +31,5 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 bcrypt = "0.15"
 once_cell = "1.19"
 ssh2 = "0.9"
+dirs = "5"
 

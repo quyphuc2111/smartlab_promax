@@ -39,6 +39,8 @@ declare global {
 
 const invoke = window.__TAURI__?.core?.invoke;
 
+type AppMode = "Teacher" | "Client";
+
 interface BackendStatus {
   running: boolean;
   message: string;
@@ -70,8 +72,39 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null);
+  const [appMode, setAppMode] = useState<AppMode>("Client");
 
-  // Start backend when Teacher/Admin logs in
+  // Load app mode and auto-start services for Teacher mode
+  useEffect(() => {
+    async function initApp() {
+      if (!invoke) return;
+      
+      try {
+        // Load saved mode from config.json
+        const mode = await invoke<AppMode>('load_app_mode');
+        setAppMode(mode);
+        
+        // If Teacher mode, start backend and broadcast
+        if (mode === "Teacher") {
+          console.log("Teacher mode detected, starting services...");
+          
+          // Start backend
+          const status = await invoke<BackendStatus>('start_backend');
+          setBackendStatus(status);
+          
+          // Start UDP broadcast for client discovery
+          await invoke('start_server_broadcast');
+          console.log("Server broadcast started");
+        }
+      } catch (error) {
+        console.error("Failed to init app:", error);
+      }
+    }
+    
+    initApp();
+  }, []);
+
+  // Start backend when Teacher/Admin logs in (fallback)
   useEffect(() => {
     if (user && invoke) {
       const needsBackend = user.role === UserRole.TEACHER || user.role === UserRole.ADMINISTRATOR;

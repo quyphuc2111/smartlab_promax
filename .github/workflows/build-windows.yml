@@ -48,68 +48,141 @@ jobs:
           cargo build --release
         shell: bash
 
-      - name: Copy backend to resources
-        run: |
-          mkdir -p src-tauri/resources
-          cp backend/target/release/ip_scanner_api.exe src-tauri/resources/
-        shell: bash
-
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__
-          releaseName: 'SmartLab v__VERSION__'
-          releaseBody: |
-            ## SmartLab - Hệ thống quản lý phòng máy thông minh
-            
-            ### Tính năng:
-            - Quản lý phòng máy và thiết bị
-            - Điều khiển máy tính từ xa
-            - Quản lý ca thực hành
-            - Hỗ trợ giảng dạy trực tuyến
-            
-            ### Cài đặt:
-            - Tải file `.msi` hoặc `.exe` bên dưới
-            - Chạy installer và làm theo hướng dẫn
-          releaseDraft: true
-          prerelease: false
 
-      - name: Create release package
+      # Create Teacher (Server) package
+      - name: Create Teacher Package
         run: |
-          mkdir -p release-package
-          cp backend/target/release/ip_scanner_api.exe release-package/
-          cp -r src-tauri/target/release/bundle/msi/*.msi release-package/ 2>/dev/null || true
-          cp -r src-tauri/target/release/bundle/nsis/*.exe release-package/ 2>/dev/null || true
+          mkdir -p release/teacher
+          cp src-tauri/target/release/bundle/nsis/*.exe release/teacher/
+          cp backend/target/release/ip_scanner_api.exe release/teacher/
+          echo '{"mode":"Teacher"}' > release/teacher/config.json
+          
+          # Create batch file to start both
+          echo '@echo off' > release/teacher/start-server.bat
+          echo 'start "" "%~dp0ip_scanner_api.exe"' >> release/teacher/start-server.bat
+          echo 'start "" "%~dp0SmartLab_*-setup.exe"' >> release/teacher/start-server.bat
         shell: bash
 
-      - name: Upload Windows Installer (MSI)
-        uses: actions/upload-artifact@v4
-        with:
-          name: smartlab-windows-msi
-          path: src-tauri/target/release/bundle/msi/*.msi
-          retention-days: 30
-          if-no-files-found: ignore
+      # Create Student (Client) package  
+      - name: Create Student Package
+        run: |
+          mkdir -p release/student
+          cp src-tauri/target/release/bundle/nsis/*.exe release/student/
+          echo '{"mode":"Client"}' > release/student/config.json
+        shell: bash
 
-      - name: Upload Windows Installer (EXE)
+      # Create combined installer with PowerShell script
+      - name: Create Combined Installer
+        run: |
+          mkdir -p release/combined
+          cp src-tauri/target/release/bundle/nsis/*.exe release/combined/
+          cp backend/target/release/ip_scanner_api.exe release/combined/
+          
+          # Create PowerShell installer script
+          cat > release/combined/Install-SmartLab.ps1 << 'EOF'
+          # SmartLab Installer Script
+          param(
+              [Parameter(Mandatory=$false)]
+              [ValidateSet("Teacher", "Student")]
+              [string]$Mode
+          )
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "================================" -ForegroundColor Cyan
+          Write-Host "  SmartLab Pro Max Installer" -ForegroundColor Cyan  
+          Write-Host "================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          if (-not $Mode) {
+              Write-Host "Chon che do cai dat:" -ForegroundColor Yellow
+              Write-Host "[1] Giao vien (Server) - Chay server, luu database" -ForegroundColor Green
+              Write-Host "[2] Hoc sinh (Client) - Ket noi den may giao vien" -ForegroundColor Blue
+              Write-Host ""
+              
+              $choice = Read-Host "Nhap lua chon (1 hoac 2)"
+              
+              switch ($choice) {
+                  "1" { $Mode = "Teacher" }
+                  "2" { $Mode = "Student" }
+                  default { 
+                      Write-Host "Lua chon khong hop le!" -ForegroundColor Red
+                      exit 1
+                  }
+              }
+          }
+
+          $InstallDir = "$env:LOCALAPPDATA\SmartLab"
+          Write-Host ""
+          Write-Host "Cai dat che do: $Mode" -ForegroundColor Cyan
+          Write-Host "Thu muc: $InstallDir" -ForegroundColor Cyan
+
+          # Create install directory
+          New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+          # Copy main app
+          $exeFile = Get-ChildItem -Path $PSScriptRoot -Filter "*.exe" | Where-Object { $_.Name -like "SmartLab*setup*" } | Select-Object -First 1
+          if ($exeFile) {
+              Write-Host "Dang cai dat ung dung chinh..." -ForegroundColor Yellow
+              Start-Process -FilePath $exeFile.FullName -Wait
+          }
+
+          # Create config
+          $config = @{ mode = $Mode } | ConvertTo-Json
+          $config | Out-File -FilePath "$InstallDir\config.json" -Encoding UTF8
+
+          if ($Mode -eq "Teacher") {
+              # Copy backend
+              $backendExe = Join-Path $PSScriptRoot "ip_scanner_api.exe"
+              if (Test-Path $backendExe) {
+                  Copy-Item $backendExe -Destination $InstallDir
+                  Write-Host "Da copy backend server" -ForegroundColor Green
+                  
+                  # Create startup shortcut
+                  $WshShell = New-Object -ComObject WScript.Shell
+                  $Shortcut = $WshShell.CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\SmartLab Server.lnk")
+                  $Shortcut.TargetPath = "$InstallDir\ip_scanner_api.exe"
+                  $Shortcut.WorkingDirectory = $InstallDir
+                  $Shortcut.Save()
+                  Write-Host "Da tao shortcut khoi dong cung Windows" -ForegroundColor Green
+              }
+          }
+
+          Write-Host ""
+          Write-Host "Cai dat hoan tat!" -ForegroundColor Green
+          Write-Host "Nhan Enter de thoat..."
+          Read-Host
+          EOF
+        shell: bash
+
+      - name: Upload Teacher Package
         uses: actions/upload-artifact@v4
         with:
-          name: smartlab-windows-exe
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          name: SmartLab-Teacher-Server
+          path: release/teacher/
           retention-days: 30
-          if-no-files-found: ignore
+
+      - name: Upload Student Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartLab-Student-Client
+          path: release/student/
+          retention-days: 30
+
+      - name: Upload Combined Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartLab-Combined-Installer
+          path: release/combined/
+          retention-days: 30
 
       - name: Upload Backend Server
         uses: actions/upload-artifact@v4
         with:
-          name: smartlab-backend-server
+          name: SmartLab-Backend-Only
           path: backend/target/release/ip_scanner_api.exe
-          retention-days: 30
-
-      - name: Upload Complete Package
-        uses: actions/upload-artifact@v4
-        with:
-          name: smartlab-complete-package
-          path: release-package/
           retention-days: 30
