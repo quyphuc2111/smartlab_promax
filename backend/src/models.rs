@@ -252,6 +252,13 @@ pub struct PingResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerStatusResult {
+    pub ip: String,
+    pub online: bool,
+    pub message: String,
+}
+
 // ==================== API RESPONSE ====================
 
 #[derive(Debug, Serialize)]

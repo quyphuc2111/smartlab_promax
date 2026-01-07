@@ -4,7 +4,7 @@ import {
   PowerOff, Eye, RotateCcw, Wifi, WifiOff
 } from 'lucide-react';
 import { RoomComputer, ComputerStatus } from '../types';
-import { getRoomComputers } from '../api';
+import { getRoomComputers, checkComputerStatus } from '../api';
 
 // Tauri invoke
 declare global {
@@ -62,14 +62,16 @@ const LabControl: React.FC = () => {
   };
 
   const checkAllStatuses = async () => {
-    if (!invoke) return;
-    
     const statuses: Record<string, boolean> = {};
     for (const pc of computers) {
       if (pc.ip_address) {
         try {
-          const result = await invoke<RemoteCommandResult>('check_computer_status', { ip: pc.ip_address });
-          statuses[pc.ip_address] = result.success;
+          const result = await checkComputerStatus(pc.ip_address);
+          if (result.success && result.data) {
+            statuses[pc.ip_address] = result.data.online;
+          } else {
+            statuses[pc.ip_address] = false;
+          }
         } catch {
           statuses[pc.ip_address] = false;
         }

@@ -36,6 +36,7 @@ async fn main() {
         .route("/api/room-computers", post(handlers::create_room_computer))
         .route("/api/room-computers/:id", put(handlers::update_room_computer))
         .route("/api/room-computers/:id", delete(handlers::delete_room_computer))
+        .route("/api/room-computers/check-status/:ip", get(handlers::check_computer_status))
         .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));

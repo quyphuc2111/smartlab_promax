@@ -270,3 +270,11 @@ export async function deleteRoomComputer(id: number): Promise<ApiResponse<string
   });
   return res.json();
 }
+
+// Check computer online status via backend
+export async function checkComputerStatus(ip: string): Promise<ApiResponse<{ip: string, online: boolean, message: string}>> {
+  const res = await fetch(`${getApiBase()}/room-computers/check-status/${ip}`, {
+    headers: headers(),
+  });
+  return res.json();
+}

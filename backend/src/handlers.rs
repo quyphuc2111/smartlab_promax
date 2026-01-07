@@ -193,10 +193,10 @@ pub async fn scan_network() -> Json<ApiResponse<Vec<HostInfo>>> {
     let ips = get_network_range(local_ip);
     let mut handles = Vec::new();
 
-    // Scan concurrently using tokio tasks
+    // Scan concurrently using tokio tasks với ICMP ping
     for ip in ips {
         let handle = tokio::spawn(async move {
-            if check_host_alive(ip) {
+            if check_host_alive_async(ip).await {
                 Some(HostInfo {
                     ip: ip.to_string(),
                     is_alive: true,
@@ -253,14 +253,44 @@ fn get_network_range(local_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
 }
 
 fn check_host_alive(ip: Ipv4Addr) -> bool {
-    let ports = [80, 443, 22, 445, 139, 3389, 8080];
-    for port in ports {
+    // Thử TCP port trước (nhanh hơn nếu có port mở)
+    let common_ports = [135, 139, 445, 3389, 22, 80, 443, 5900];
+    for port in common_ports {
         let socket = SocketAddr::new(IpAddr::V4(ip), port);
-        if TcpStream::connect_timeout(&socket, Duration::from_millis(100)).is_ok() {
+        if TcpStream::connect_timeout(&socket, Duration::from_millis(50)).is_ok() {
             return true;
         }
     }
     false
+}
+
+// ICMP ping async - dùng cho check status chính xác hơn
+async fn icmp_ping(ip: Ipv4Addr) -> bool {
+    use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence};
+    
+    let client = match Client::new(&Config::default()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    
+    let mut pinger = client.pinger(IpAddr::V4(ip), PingIdentifier(rand::random())).await;
+    pinger.timeout(Duration::from_millis(500));
+    
+    match pinger.ping(PingSequence(0), &[]).await {
+        Ok((IcmpPacket::V4(_), _)) => true,
+        _ => false,
+    }
+}
+
+// Check host với cả ICMP và TCP
+async fn check_host_alive_async(ip: Ipv4Addr) -> bool {
+    // Thử ICMP ping trước
+    if icmp_ping(ip).await {
+        return true;
+    }
+    
+    // Fallback sang TCP nếu ICMP bị chặn
+    check_host_alive(ip)
 }
 
 fn tcp_ping(addr: Ipv4Addr) -> PingResult {
@@ -385,4 +415,21 @@ pub async fn delete_room_computer(Path(id): Path<i64>) -> (StatusCode, Json<ApiR
             Json(ApiResponse::err(&format!("Failed to delete: {}", e))),
         ),
     }
+}
+
+// Check computer online status
+pub async fn check_computer_status(Path(ip): Path<String>) -> Json<ApiResponse<ComputerStatusResult>> {
+    let addr: Ipv4Addr = match ip.parse() {
+        Ok(a) => a,
+        Err(_) => return Json(ApiResponse::err("Invalid IP address")),
+    };
+
+    // Dùng ICMP ping để check chính xác
+    let is_online = check_host_alive_async(addr).await;
+    
+    Json(ApiResponse::ok(ComputerStatusResult {
+        ip,
+        online: is_online,
+        message: if is_online { "Online".to_string() } else { "Offline".to_string() },
+    }))
 }
