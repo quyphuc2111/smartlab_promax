@@ -74,6 +74,9 @@ export default function App() {
   const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null);
   const [appMode, setAppMode] = useState<AppMode>("Client");
 
+  // Log app mode for debugging
+  console.log("Current app mode:", appMode);
+
   // Load app mode and auto-start services for Teacher mode
   useEffect(() => {
     async function initApp() {
