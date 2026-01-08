@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { 
-  Monitor, X, Maximize2, Minimize2, Settings, Wifi, WifiOff,
-  MousePointer, Keyboard, RefreshCw
+  Monitor, X, Maximize2, Minimize2,
+  MousePointer, Keyboard, RefreshCw, Wifi, WifiOff
 } from 'lucide-react';
 
 interface RemoteViewerProps {

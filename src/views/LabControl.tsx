@@ -171,27 +171,6 @@ const LabControl: React.FC = () => {
     }
   };
 
-  const handleRemoteDesktop = async (pc: RoomComputer) => {
-    if (!pc.ip_address) return;
-    
-    setActionLoading(`rdp-${pc.room_computer_id}`);
-    try {
-      console.log('Opening remote desktop to:', pc.ip_address);
-      const result = await invoke<RemoteCommandResult>('open_remote_desktop', { ip: pc.ip_address });
-      console.log('Remote desktop result:', result);
-      if (result.success) {
-        showNotification('success', result.message);
-      } else {
-        showNotification('error', result.message);
-      }
-    } catch (error) {
-      console.error('Remote desktop error:', error);
-      showNotification('error', 'Không thể mở Remote Desktop');
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
   const handleShutdown = async (pc: RoomComputer) => {
     if (!pc.ip_address) return;
     if (!confirm(`Bạn có chắc muốn tắt máy ${pc.computer_name}?`)) return;
