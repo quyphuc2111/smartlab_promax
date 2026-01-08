@@ -10,17 +10,23 @@ use std::sync::Mutex as StdMutex;
 use bcrypt::{hash, verify, DEFAULT_COST};
 use serde::Deserialize;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use tauri::Manager;
+use tokio::net::TcpListener;
+use tokio_tungstenite::accept_async;
+use futures_util::{StreamExt, SinkExt};
 
 // Constants for UDP Discovery
 const DISCOVERY_PORT: u16 = 5959;
 const DISCOVERY_MAGIC: &[u8] = b"SMARTLAB_SERVER";
 const BROADCAST_INTERVAL_MS: u64 = 2000;
+const REMOTE_CONTROL_PORT: u16 = 5960;
 
 // App mode
 static APP_MODE: Lazy<StdMutex<AppMode>> = Lazy::new(|| StdMutex::new(AppMode::Client));
 static UDP_BROADCASTER: AtomicBool = AtomicBool::new(false);
+static REMOTE_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+static REMOTE_SERVER_PORT: AtomicU16 = AtomicU16::new(REMOTE_CONTROL_PORT);
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum AppMode {
@@ -536,6 +542,234 @@ async fn open_vnc_viewer(ip: String, port: Option<u16>) -> Result<RemoteCommandR
     })
 }
 
+// ==================== SCREEN CAPTURE & CONTROL ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenCaptureResult {
+    pub success: bool,
+    pub image_base64: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub message: String,
+}
+
+/// Capture màn hình local và trả về base64 image
+#[tauri::command]
+fn capture_screen() -> Result<ScreenCaptureResult, String> {
+    use scrap::{Capturer, Display};
+    use std::io::ErrorKind::WouldBlock;
+    
+    let display = Display::primary().map_err(|e| format!("No display found: {}", e))?;
+    let mut capturer = Capturer::new(display).map_err(|e| format!("Capturer error: {}", e))?;
+    
+    let width = capturer.width() as u32;
+    let height = capturer.height() as u32;
+    
+    // Try to capture frame (may need multiple attempts)
+    let mut attempts = 0;
+    let frame = loop {
+        match capturer.frame() {
+            Ok(frame) => break frame,
+            Err(e) if e.kind() == WouldBlock => {
+                attempts += 1;
+                if attempts > 50 {
+                    return Ok(ScreenCaptureResult {
+                        success: false,
+                        image_base64: None,
+                        width: 0,
+                        height: 0,
+                        message: "Timeout waiting for frame".to_string(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("Capture error: {}", e)),
+        }
+    };
+    
+    // Convert BGRA to RGBA
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in frame.chunks(4) {
+        rgba.push(pixel[2]); // R
+        rgba.push(pixel[1]); // G
+        rgba.push(pixel[0]); // B
+        rgba.push(pixel[3]); // A
+    }
+    
+    // Encode to PNG
+    let img = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or("Failed to create image")?;
+    
+    let mut png_data = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+    encoder.encode(&img, width, height, image::ColorType::Rgba8)
+        .map_err(|e| format!("PNG encode error: {}", e))?;
+    
+    // Convert to base64
+    use base64::Engine;
+    let base64_str = base64::engine::general_purpose::STANDARD.encode(&png_data);
+    
+    Ok(ScreenCaptureResult {
+        success: true,
+        image_base64: Some(base64_str),
+        width,
+        height,
+        message: "Screen captured".to_string(),
+    })
+}
+
+/// Capture màn hình với quality thấp hơn (JPEG) để stream nhanh hơn
+#[tauri::command]
+fn capture_screen_jpeg(quality: Option<u8>) -> Result<ScreenCaptureResult, String> {
+    use scrap::{Capturer, Display};
+    use std::io::ErrorKind::WouldBlock;
+    
+    let display = Display::primary().map_err(|e| format!("No display found: {}", e))?;
+    let mut capturer = Capturer::new(display).map_err(|e| format!("Capturer error: {}", e))?;
+    
+    let width = capturer.width() as u32;
+    let height = capturer.height() as u32;
+    
+    let mut attempts = 0;
+    let frame = loop {
+        match capturer.frame() {
+            Ok(frame) => break frame,
+            Err(e) if e.kind() == WouldBlock => {
+                attempts += 1;
+                if attempts > 50 {
+                    return Ok(ScreenCaptureResult {
+                        success: false,
+                        image_base64: None,
+                        width: 0,
+                        height: 0,
+                        message: "Timeout".to_string(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("Capture error: {}", e)),
+        }
+    };
+    
+    // Convert BGRA to RGB
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for pixel in frame.chunks(4) {
+        rgb.push(pixel[2]); // R
+        rgb.push(pixel[1]); // G
+        rgb.push(pixel[0]); // B
+    }
+    
+    let img = image::RgbImage::from_raw(width, height, rgb)
+        .ok_or("Failed to create image")?;
+    
+    // Encode to JPEG
+    let mut jpeg_data = Vec::new();
+    let q = quality.unwrap_or(50);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, q);
+    encoder.encode(&img, width, height, image::ColorType::Rgb8)
+        .map_err(|e| format!("JPEG encode error: {}", e))?;
+    
+    use base64::Engine;
+    let base64_str = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
+    
+    Ok(ScreenCaptureResult {
+        success: true,
+        image_base64: Some(base64_str),
+        width,
+        height,
+        message: "Screen captured".to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InputResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Simulate mouse click tại vị trí x, y
+#[tauri::command]
+fn simulate_mouse_click(x: i32, y: i32, button: Option<String>) -> Result<InputResult, String> {
+    use enigo::{Enigo, Mouse, Settings, Coordinate, Button};
+    
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    
+    // Move mouse to position
+    enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| e.to_string())?;
+    
+    // Click
+    let btn = match button.as_deref() {
+        Some("right") => Button::Right,
+        Some("middle") => Button::Middle,
+        _ => Button::Left,
+    };
+    
+    enigo.button(btn, enigo::Direction::Click).map_err(|e| e.to_string())?;
+    
+    Ok(InputResult {
+        success: true,
+        message: format!("Clicked at ({}, {})", x, y),
+    })
+}
+
+/// Simulate mouse move
+#[tauri::command]
+fn simulate_mouse_move(x: i32, y: i32) -> Result<InputResult, String> {
+    use enigo::{Enigo, Mouse, Settings, Coordinate};
+    
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| e.to_string())?;
+    
+    Ok(InputResult {
+        success: true,
+        message: format!("Mouse moved to ({}, {})", x, y),
+    })
+}
+
+/// Simulate keyboard input
+#[tauri::command]
+fn simulate_key_press(key: String) -> Result<InputResult, String> {
+    use enigo::{Enigo, Keyboard, Settings, Key};
+    
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    
+    // Handle special keys
+    let result = match key.to_lowercase().as_str() {
+        "enter" | "return" => enigo.key(Key::Return, enigo::Direction::Click),
+        "tab" => enigo.key(Key::Tab, enigo::Direction::Click),
+        "escape" | "esc" => enigo.key(Key::Escape, enigo::Direction::Click),
+        "backspace" => enigo.key(Key::Backspace, enigo::Direction::Click),
+        "delete" => enigo.key(Key::Delete, enigo::Direction::Click),
+        "space" => enigo.key(Key::Space, enigo::Direction::Click),
+        "up" => enigo.key(Key::UpArrow, enigo::Direction::Click),
+        "down" => enigo.key(Key::DownArrow, enigo::Direction::Click),
+        "left" => enigo.key(Key::LeftArrow, enigo::Direction::Click),
+        "right" => enigo.key(Key::RightArrow, enigo::Direction::Click),
+        _ => enigo.text(&key),
+    };
+    
+    result.map_err(|e| e.to_string())?;
+    
+    Ok(InputResult {
+        success: true,
+        message: format!("Key pressed: {}", key),
+    })
+}
+
+/// Type text
+#[tauri::command]
+fn simulate_type_text(text: String) -> Result<InputResult, String> {
+    use enigo::{Enigo, Keyboard, Settings};
+    
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo.text(&text).map_err(|e| e.to_string())?;
+    
+    Ok(InputResult {
+        success: true,
+        message: format!("Typed: {}", text),
+    })
+}
+
 /// Mở Remote Desktop (RDP) cho Windows
 #[tauri::command]
 async fn open_remote_desktop(ip: String) -> Result<RemoteCommandResult, String> {
@@ -850,6 +1084,447 @@ fn check_backend_status() -> BackendStatus {
     }
 }
 
+// ==================== REMOTE CONTROL SERVER (Student/Controlled PC) ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteServerStatus {
+    pub running: bool,
+    pub port: u16,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum RemoteInputEvent {
+    #[serde(rename = "mouse_move")]
+    MouseMove { x: i32, y: i32 },
+    #[serde(rename = "mouse_click")]
+    MouseClick { x: i32, y: i32, button: String },
+    #[serde(rename = "mouse_down")]
+    MouseDown { x: i32, y: i32, button: String },
+    #[serde(rename = "mouse_up")]
+    MouseUp { x: i32, y: i32, button: String },
+    #[serde(rename = "mouse_scroll")]
+    MouseScroll { delta_x: i32, delta_y: i32 },
+    #[serde(rename = "key_press")]
+    KeyPress { key: String },
+    #[serde(rename = "key_down")]
+    KeyDown { key: String },
+    #[serde(rename = "key_up")]
+    KeyUp { key: String },
+    #[serde(rename = "type_text")]
+    TypeText { text: String },
+}
+
+fn handle_remote_input(event: RemoteInputEvent) -> Result<(), String> {
+    use enigo::{Enigo, Mouse, Keyboard, Settings, Coordinate, Button, Key, Direction};
+    
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    
+    match event {
+        RemoteInputEvent::MouseMove { x, y } => {
+            enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| e.to_string())?;
+        }
+        RemoteInputEvent::MouseClick { x, y, button } => {
+            enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| e.to_string())?;
+            let btn = match button.as_str() {
+                "right" => Button::Right,
+                "middle" => Button::Middle,
+                _ => Button::Left,
+            };
+            enigo.button(btn, Direction::Click).map_err(|e| e.to_string())?;
+        }
+        RemoteInputEvent::MouseDown { x, y, button } => {
+            enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| e.to_string())?;
+            let btn = match button.as_str() {
+                "right" => Button::Right,
+                "middle" => Button::Middle,
+                _ => Button::Left,
+            };
+            enigo.button(btn, Direction::Press).map_err(|e| e.to_string())?;
+        }
+        RemoteInputEvent::MouseUp { x, y, button } => {
+            enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| e.to_string())?;
+            let btn = match button.as_str() {
+                "right" => Button::Right,
+                "middle" => Button::Middle,
+                _ => Button::Left,
+            };
+            enigo.button(btn, Direction::Release).map_err(|e| e.to_string())?;
+        }
+        RemoteInputEvent::MouseScroll { delta_x, delta_y } => {
+            if delta_y != 0 {
+                enigo.scroll(delta_y, enigo::Axis::Vertical).map_err(|e| e.to_string())?;
+            }
+            if delta_x != 0 {
+                enigo.scroll(delta_x, enigo::Axis::Horizontal).map_err(|e| e.to_string())?;
+            }
+        }
+        RemoteInputEvent::KeyPress { key } => {
+            handle_key_event(&mut enigo, &key, Direction::Click)?;
+        }
+        RemoteInputEvent::KeyDown { key } => {
+            handle_key_event(&mut enigo, &key, Direction::Press)?;
+        }
+        RemoteInputEvent::KeyUp { key } => {
+            handle_key_event(&mut enigo, &key, Direction::Release)?;
+        }
+        RemoteInputEvent::TypeText { text } => {
+            enigo.text(&text).map_err(|e| e.to_string())?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_key_event(enigo: &mut enigo::Enigo, key: &str, direction: enigo::Direction) -> Result<(), String> {
+    use enigo::{Keyboard, Key};
+    
+    let result = match key.to_lowercase().as_str() {
+        "enter" | "return" => enigo.key(Key::Return, direction),
+        "tab" => enigo.key(Key::Tab, direction),
+        "escape" | "esc" => enigo.key(Key::Escape, direction),
+        "backspace" => enigo.key(Key::Backspace, direction),
+        "delete" => enigo.key(Key::Delete, direction),
+        "space" => enigo.key(Key::Space, direction),
+        "up" | "arrowup" => enigo.key(Key::UpArrow, direction),
+        "down" | "arrowdown" => enigo.key(Key::DownArrow, direction),
+        "left" | "arrowleft" => enigo.key(Key::LeftArrow, direction),
+        "right" | "arrowright" => enigo.key(Key::RightArrow, direction),
+        "home" => enigo.key(Key::Home, direction),
+        "end" => enigo.key(Key::End, direction),
+        "pageup" => enigo.key(Key::PageUp, direction),
+        "pagedown" => enigo.key(Key::PageDown, direction),
+        "shift" => enigo.key(Key::Shift, direction),
+        "control" | "ctrl" => enigo.key(Key::Control, direction),
+        "alt" => enigo.key(Key::Alt, direction),
+        "meta" | "win" | "cmd" => enigo.key(Key::Meta, direction),
+        "f1" => enigo.key(Key::F1, direction),
+        "f2" => enigo.key(Key::F2, direction),
+        "f3" => enigo.key(Key::F3, direction),
+        "f4" => enigo.key(Key::F4, direction),
+        "f5" => enigo.key(Key::F5, direction),
+        "f6" => enigo.key(Key::F6, direction),
+        "f7" => enigo.key(Key::F7, direction),
+        "f8" => enigo.key(Key::F8, direction),
+        "f9" => enigo.key(Key::F9, direction),
+        "f10" => enigo.key(Key::F10, direction),
+        "f11" => enigo.key(Key::F11, direction),
+        "f12" => enigo.key(Key::F12, direction),
+        _ => {
+            if key.len() == 1 {
+                if let Some(c) = key.chars().next() {
+                    enigo.key(Key::Unicode(c), direction)
+                } else {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    };
+    
+    result.map_err(|e| e.to_string())
+}
+
+fn capture_screen_for_stream(quality: u8) -> Option<Vec<u8>> {
+    use scrap::{Capturer, Display};
+    use std::io::ErrorKind::WouldBlock;
+    
+    let display = Display::primary().ok()?;
+    let mut capturer = Capturer::new(display).ok()?;
+    
+    let width = capturer.width() as u32;
+    let height = capturer.height() as u32;
+    
+    let mut attempts = 0;
+    let frame = loop {
+        match capturer.frame() {
+            Ok(frame) => break frame,
+            Err(e) if e.kind() == WouldBlock => {
+                attempts += 1;
+                if attempts > 30 {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    };
+    
+    // Convert BGRA to RGB
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for pixel in frame.chunks(4) {
+        rgb.push(pixel[2]); // R
+        rgb.push(pixel[1]); // G
+        rgb.push(pixel[0]); // B
+    }
+    
+    let img = image::RgbImage::from_raw(width, height, rgb)?;
+    
+    let mut jpeg_data = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, quality);
+    encoder.encode(&img, width, height, image::ColorType::Rgb8).ok()?;
+    
+    Some(jpeg_data)
+}
+
+/// Start remote control server (chạy trên Student PC để cho phép Teacher điều khiển)
+#[tauri::command]
+async fn start_remote_server(port: Option<u16>) -> Result<RemoteServerStatus, String> {
+    if REMOTE_SERVER_RUNNING.load(Ordering::SeqCst) {
+        let current_port = REMOTE_SERVER_PORT.load(Ordering::SeqCst);
+        return Ok(RemoteServerStatus {
+            running: true,
+            port: current_port,
+            message: "Server already running".to_string(),
+        });
+    }
+    
+    let server_port = port.unwrap_or(REMOTE_CONTROL_PORT);
+    REMOTE_SERVER_PORT.store(server_port, Ordering::SeqCst);
+    
+    let addr = format!("0.0.0.0:{}", server_port);
+    let listener = TcpListener::bind(&addr).await
+        .map_err(|e| format!("Failed to bind: {}", e))?;
+    
+    REMOTE_SERVER_RUNNING.store(true, Ordering::SeqCst);
+    
+    tokio::spawn(async move {
+        println!("Remote control server started on port {}", server_port);
+        
+        while REMOTE_SERVER_RUNNING.load(Ordering::SeqCst) {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    println!("New connection from: {}", addr);
+                    
+                    tokio::spawn(async move {
+                        if let Ok(ws_stream) = accept_async(stream).await {
+                            let (mut write, mut read) = ws_stream.split();
+                            
+                            // Spawn screen streaming task
+                            let streaming = Arc::new(AtomicBool::new(true));
+                            let streaming_clone = streaming.clone();
+                            
+                            let stream_task = tokio::spawn(async move {
+                                while streaming_clone.load(Ordering::SeqCst) {
+                                    if let Some(frame_data) = capture_screen_for_stream(40) {
+                                        use base64::Engine;
+                                        let base64_frame = base64::engine::general_purpose::STANDARD.encode(&frame_data);
+                                        let msg = serde_json::json!({
+                                            "type": "frame",
+                                            "data": base64_frame
+                                        });
+                                        
+                                        if write.send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(50)).await; // ~20 FPS
+                                }
+                            });
+                            
+                            // Handle incoming input events
+                            while let Some(msg) = read.next().await {
+                                match msg {
+                                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                                        if let Ok(event) = serde_json::from_str::<RemoteInputEvent>(&text) {
+                                            let _ = handle_remote_input(event);
+                                        }
+                                    }
+                                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                                    Err(_) => break,
+                                    _ => {}
+                                }
+                            }
+                            
+                            streaming.store(false, Ordering::SeqCst);
+                            let _ = stream_task.await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Accept error: {}", e);
+                }
+            }
+        }
+    });
+    
+    Ok(RemoteServerStatus {
+        running: true,
+        port: server_port,
+        message: format!("Server started on port {}", server_port),
+    })
+}
+
+/// Stop remote control server
+#[tauri::command]
+fn stop_remote_server() -> RemoteServerStatus {
+    REMOTE_SERVER_RUNNING.store(false, Ordering::SeqCst);
+    RemoteServerStatus {
+        running: false,
+        port: REMOTE_SERVER_PORT.load(Ordering::SeqCst),
+        message: "Server stopped".to_string(),
+    }
+}
+
+/// Get remote server status
+#[tauri::command]
+fn get_remote_server_status() -> RemoteServerStatus {
+    let running = REMOTE_SERVER_RUNNING.load(Ordering::SeqCst);
+    let port = REMOTE_SERVER_PORT.load(Ordering::SeqCst);
+    RemoteServerStatus {
+        running,
+        port,
+        message: if running { "Running".to_string() } else { "Stopped".to_string() },
+    }
+}
+
+// ==================== REMOTE CONTROL CLIENT (Teacher/Controller PC) ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteConnectionResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Connect to remote PC for control (trả về WebSocket URL để frontend connect)
+#[tauri::command]
+fn get_remote_control_url(ip: String, port: Option<u16>) -> String {
+    let p = port.unwrap_or(REMOTE_CONTROL_PORT);
+    format!("ws://{}:{}", ip, p)
+}
+
+/// Check if remote control server is available on target IP
+#[tauri::command]
+async fn check_remote_control_available(ip: String, port: Option<u16>) -> Result<RemoteConnectionResult, String> {
+    let p = port.unwrap_or(REMOTE_CONTROL_PORT);
+    let addr: SocketAddr = format!("{}:{}", ip, p).parse()
+        .map_err(|_| "Invalid address")?;
+    
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(_) => Ok(RemoteConnectionResult {
+            success: true,
+            message: format!("Remote control available at {}:{}", ip, p),
+        }),
+        Err(e) => Ok(RemoteConnectionResult {
+            success: false,
+            message: format!("Cannot connect: {}", e),
+        }),
+    }
+}
+
+// ==================== UDP DISCOVERY WITH REMOTE CONTROL ====================
+
+/// Start UDP broadcast with remote control port info
+#[tauri::command]
+async fn start_remote_broadcast() -> Result<String, String> {
+    if UDP_BROADCASTER.load(Ordering::SeqCst) {
+        return Ok("Broadcast already running".to_string());
+    }
+    
+    UDP_BROADCASTER.store(true, Ordering::SeqCst);
+    
+    tokio::spawn(async {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to bind UDP socket: {}", e);
+                UDP_BROADCASTER.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        
+        socket.set_broadcast(true).ok();
+        
+        let local_ip = get_local_ip().map(|ip| ip.to_string()).unwrap_or_default();
+        let remote_port = REMOTE_SERVER_PORT.load(Ordering::SeqCst);
+        // Format: MAGIC|IP|REMOTE_PORT
+        let message = format!("{}|{}|{}", String::from_utf8_lossy(DISCOVERY_MAGIC), local_ip, remote_port);
+        
+        while UDP_BROADCASTER.load(Ordering::SeqCst) {
+            let _ = socket.send_to(message.as_bytes(), format!("255.255.255.255:{}", DISCOVERY_PORT));
+            
+            if let Some(ip) = get_local_ip() {
+                let octets = ip.octets();
+                let subnet_broadcast = format!("{}.{}.{}.255:{}", octets[0], octets[1], octets[2], DISCOVERY_PORT);
+                let _ = socket.send_to(message.as_bytes(), subnet_broadcast);
+            }
+            
+            std::thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
+        }
+    });
+    
+    Ok("Remote broadcast started".to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredPeer {
+    pub ip: String,
+    pub remote_port: u16,
+    pub available: bool,
+}
+
+/// Discover peers with remote control capability
+#[tauri::command]
+async fn discover_remote_peers() -> Result<Vec<DiscoveredPeer>, String> {
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT))
+        .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
+        .map_err(|e| e.to_string())?;
+    
+    socket.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    socket.set_broadcast(true).ok();
+    
+    // Send discovery request
+    let request = b"SMARTLAB_DISCOVER";
+    let _ = socket.send_to(request, format!("255.255.255.255:{}", DISCOVERY_PORT));
+    
+    if let Some(ip) = get_local_ip() {
+        let octets = ip.octets();
+        let subnet_broadcast = format!("{}.{}.{}.255:{}", octets[0], octets[1], octets[2], DISCOVERY_PORT);
+        let _ = socket.send_to(request, subnet_broadcast);
+    }
+    
+    let mut peers = Vec::new();
+    let mut buf = [0u8; 256];
+    let start = std::time::Instant::now();
+    let local_ip = get_local_ip().map(|ip| ip.to_string()).unwrap_or_default();
+    
+    while start.elapsed() < Duration::from_secs(3) {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _addr)) => {
+                let message = String::from_utf8_lossy(&buf[..len]);
+                let magic = String::from_utf8_lossy(DISCOVERY_MAGIC);
+                if message.starts_with(magic.as_ref()) {
+                    let parts: Vec<&str> = message.split('|').collect();
+                    if parts.len() >= 2 {
+                        let peer_ip = parts[1].to_string();
+                        // Skip self
+                        if peer_ip == local_ip {
+                            continue;
+                        }
+                        let remote_port = parts.get(2)
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(REMOTE_CONTROL_PORT);
+                        
+                        // Check if not already in list
+                        if !peers.iter().any(|p: &DiscoveredPeer| p.ip == peer_ip) {
+                            peers.push(DiscoveredPeer {
+                                ip: peer_ip,
+                                remote_port,
+                                available: true,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    Ok(peers)
+}
+
 fn find_backend_path(app_handle: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     // Production mode - check resource directory first
     if let Ok(resource_path) = app_handle.path().resource_dir() {
@@ -941,7 +1616,22 @@ pub fn run() {
             load_app_mode,
             start_server_broadcast,
             stop_server_broadcast,
-            discover_server_udp
+            discover_server_udp,
+            // Screen capture & control
+            capture_screen,
+            capture_screen_jpeg,
+            simulate_mouse_click,
+            simulate_mouse_move,
+            simulate_key_press,
+            simulate_type_text,
+            // Remote control LAN
+            start_remote_server,
+            stop_remote_server,
+            get_remote_server_status,
+            get_remote_control_url,
+            check_remote_control_available,
+            start_remote_broadcast,
+            discover_remote_peers
         ])
         .on_window_event(|_window, event| {
             // Stop backend when app closes
