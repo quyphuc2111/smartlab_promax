@@ -14,6 +14,9 @@ use std::net::SocketAddr;
 async fn main() {
     // Initialize database
     db::init_db().expect("Failed to initialize database");
+    
+    // Seed default users (admin, teacher, student)
+    db::seed_default_users().expect("Failed to seed default users");
 
     // CORS configuration
     let cors = CorsLayer::new()

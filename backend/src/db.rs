@@ -383,3 +383,45 @@ pub fn find_room_computer_by_ip(ip: &str) -> Option<i64> {
         |row| row.get(0),
     ).ok()
 }
+
+// ==================== SEED DEFAULT USERS ====================
+
+pub fn seed_default_users() -> SqliteResult<()> {
+    use bcrypt::{hash, DEFAULT_COST};
+    
+    let conn = DB.lock().unwrap();
+    
+    // Check if users already exist
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user_accounts",
+        [],
+        |row| row.get(0),
+    )?;
+    
+    if count > 0 {
+        println!("✅ Users already exist, skipping seed");
+        return Ok(());
+    }
+    
+    // Default users with their roles
+    let default_users = [
+        ("admin", "admin123", "Administrator"),
+        ("teacher", "teacher123", "Teacher"),
+        ("student", "student123", "Student"),
+    ];
+    
+    for (username, password, role) in default_users {
+        let password_hash = hash(password, DEFAULT_COST)
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+        
+        conn.execute(
+            "INSERT INTO user_accounts (user_name, password_hash, role, status) VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![username, password_hash, role],
+        )?;
+        
+        println!("✅ Created user: {} ({})", username, role);
+    }
+    
+    println!("✅ Default users seeded successfully");
+    Ok(())
+}

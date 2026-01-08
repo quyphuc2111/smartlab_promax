@@ -2,15 +2,28 @@ import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { 
   Monitor, Grid, List, Wrench, AlertTriangle, CheckCircle2, RefreshCw,
-  PowerOff, Eye, RotateCcw, Wifi, WifiOff
+  PowerOff, Eye, RotateCcw, Wifi, WifiOff, Play, Square
 } from 'lucide-react';
 import { RoomComputer, ComputerStatus } from '../types';
 import { getRoomComputers, checkComputerStatus } from '../api';
+import RemoteViewer from './RemoteViewer';
 
 interface RemoteCommandResult {
   success: boolean;
   message: string;
   ip: string;
+}
+
+interface RemoteServerStatus {
+  running: boolean;
+  port: number;
+  message: string;
+}
+
+interface DiscoveredPeer {
+  ip: string;
+  remote_port: number;
+  available: boolean;
 }
 
 const LabControl: React.FC = () => {
@@ -21,9 +34,16 @@ const LabControl: React.FC = () => {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [notification, setNotification] = useState<{type: 'success' | 'error', message: string} | null>(null);
   const [computerStatuses, setComputerStatuses] = useState<Record<string, boolean>>({});
+  
+  // Remote control state
+  const [remoteServerRunning, setRemoteServerRunning] = useState(false);
+  const [remoteServerPort, setRemoteServerPort] = useState(5960);
+  const [discoveredPeers, setDiscoveredPeers] = useState<DiscoveredPeer[]>([]);
+  const [remoteViewerTarget, setRemoteViewerTarget] = useState<{ip: string, port: number, name: string} | null>(null);
 
   useEffect(() => {
     loadComputers();
+    checkRemoteServerStatus();
   }, []);
 
   useEffect(() => {
@@ -31,6 +51,58 @@ const LabControl: React.FC = () => {
       checkAllStatuses();
     }
   }, [computers]);
+
+  const checkRemoteServerStatus = async () => {
+    try {
+      const status = await invoke<RemoteServerStatus>('get_remote_server_status');
+      setRemoteServerRunning(status.running);
+      setRemoteServerPort(status.port);
+    } catch (error) {
+      console.error('Failed to check remote server status:', error);
+    }
+  };
+
+  const toggleRemoteServer = async () => {
+    try {
+      if (remoteServerRunning) {
+        await invoke('stop_remote_server');
+        await invoke('stop_server_broadcast');
+        setRemoteServerRunning(false);
+        showNotification('success', 'Đã tắt Remote Server');
+      } else {
+        const status = await invoke<RemoteServerStatus>('start_remote_server', { port: remoteServerPort });
+        await invoke('start_remote_broadcast');
+        setRemoteServerRunning(status.running);
+        showNotification('success', `Remote Server đang chạy trên port ${status.port}`);
+      }
+    } catch (error) {
+      console.error('Failed to toggle remote server:', error);
+      showNotification('error', 'Không thể thay đổi trạng thái Remote Server');
+    }
+  };
+
+  const discoverPeers = async () => {
+    try {
+      const peers = await invoke<DiscoveredPeer[]>('discover_remote_peers');
+      setDiscoveredPeers(peers);
+      if (peers.length > 0) {
+        showNotification('success', `Tìm thấy ${peers.length} máy có thể điều khiển`);
+      } else {
+        showNotification('error', 'Không tìm thấy máy nào');
+      }
+    } catch (error) {
+      console.error('Failed to discover peers:', error);
+      showNotification('error', 'Lỗi khi tìm kiếm máy');
+    }
+  };
+
+  const openRemoteViewer = (ip: string, port: number, name: string) => {
+    setRemoteViewerTarget({ ip, port, name });
+  };
+
+  const closeRemoteViewer = () => {
+    setRemoteViewerTarget(null);
+  };
 
   const loadComputers = async () => {
     setLoading(true);
@@ -191,6 +263,16 @@ const LabControl: React.FC = () => {
 
   return (
     <div className="space-y-8">
+      {/* Remote Viewer Modal */}
+      {remoteViewerTarget && (
+        <RemoteViewer
+          ip={remoteViewerTarget.ip}
+          port={remoteViewerTarget.port}
+          computerName={remoteViewerTarget.name}
+          onClose={closeRemoteViewer}
+        />
+      )}
+
       {/* Notification */}
       {notification && (
         <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-xl shadow-lg flex items-center gap-2 ${
@@ -200,6 +282,74 @@ const LabControl: React.FC = () => {
           {notification.message}
         </div>
       )}
+
+      {/* Remote Control Panel */}
+      <div className="bg-gradient-to-r from-indigo-600 to-purple-600 rounded-2xl p-6 text-white">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-bold flex items-center gap-2">
+              <Monitor className="w-5 h-5" />
+              Remote Control (LAN)
+            </h3>
+            <p className="text-indigo-200 text-sm mt-1">
+              Cho phép điều khiển máy tính từ xa qua mạng LAN
+            </p>
+          </div>
+          
+          <div className="flex items-center gap-3">
+            {/* Server toggle */}
+            <div className="flex items-center gap-2 bg-white/10 rounded-xl px-4 py-2">
+              <span className="text-sm">Server:</span>
+              <button
+                onClick={toggleRemoteServer}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-bold transition ${
+                  remoteServerRunning 
+                    ? 'bg-emerald-500 hover:bg-emerald-400' 
+                    : 'bg-slate-600 hover:bg-slate-500'
+                }`}
+              >
+                {remoteServerRunning ? (
+                  <>
+                    <Square className="w-3 h-3" /> Đang chạy (:{remoteServerPort})
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-3 h-3" /> Bật Server
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Discover peers */}
+            <button
+              onClick={discoverPeers}
+              className="flex items-center gap-2 px-4 py-2 bg-white/20 hover:bg-white/30 rounded-xl text-sm font-bold transition"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Tìm máy
+            </button>
+          </div>
+        </div>
+
+        {/* Discovered peers */}
+        {discoveredPeers.length > 0 && (
+          <div className="mt-4 pt-4 border-t border-white/20">
+            <h4 className="text-sm font-bold mb-2">Máy tìm thấy ({discoveredPeers.length}):</h4>
+            <div className="flex flex-wrap gap-2">
+              {discoveredPeers.map((peer) => (
+                <button
+                  key={peer.ip}
+                  onClick={() => openRemoteViewer(peer.ip, peer.remote_port, peer.ip)}
+                  className="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm transition"
+                >
+                  <Monitor className="w-4 h-4" />
+                  {peer.ip}:{peer.remote_port}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div className="flex items-center gap-6">
@@ -273,7 +423,7 @@ const LabControl: React.FC = () => {
                 {isActive(pc.status) && (
                   <div className="absolute inset-0 bg-slate-900/95 rounded-3xl opacity-0 group-hover:opacity-100 transition-all duration-300 flex flex-col items-center justify-center p-4 gap-2 scale-95 group-hover:scale-100">
                      <button 
-                       onClick={() => handleRemoteDesktop(pc)}
+                       onClick={() => openRemoteViewer(pc.ip_address!, 5960, pc.computer_name)}
                        disabled={!online || actionLoading !== null}
                        className="w-full py-2 bg-indigo-600 text-white text-[10px] font-black rounded-xl uppercase tracking-widest hover:bg-indigo-500 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
                      >
